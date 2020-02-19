@@ -1,0 +1,648 @@
+install.packages("BiocManager")
+install.packages("doSNOW")
+install.packages("plot3D")
+install.packages("ggplot2")
+install.packages("umap")
+install.packages("gridExtra")
+install.packages("gridExtra")
+getOption("unzip")
+Sys.getenv("TAR")
+options(unzip = "/opt/conda/bin/unzip")
+Sys.setenv(TAR = "/bin/tar")
+Sys.setenv(unzip = "/usr/bin/unzip")
+devtools::install_github("GreenleafLab/chromVARmotifs")
+getOption("unzip")
+Sys.getenv("TAR")
+options(unzip = "/opt/conda/bin/unzip")
+Sys.setenv(TAR = "/bin/tar")
+Sys.setenv(unzip = "/usr/bin/unzip")
+
+devtools::install_github("r3fang/SnapATAC")
+devtools::install_github("GreenleafLab/chromVARmotifs")
+BiocManager::install("chromVAR")
+BiocManager::install("motifmatchr")
+BiocManager::install("BSgenome.Mmusculus.UCSC.mm10")
+BiocManager::install("JASPAR2016")
+BiocManager::install("rGREAT")
+
+library(leiden)
+library(uwot);
+library(umap)
+library(SnapATAC)
+library(ggplot2)
+library(GenomicRanges)
+library(BiocManager)
+library(stringr)
+library(chromVAR)
+require(gridExtra)
+library(JASPAR2016)
+library(chromVARmotifs)
+library(ggplot2)
+library(devtools)
+library(Seurat)
+library(SnapATAC)
+library(motifmatchr)
+library(SummarizedExperiment);
+library(BSgenome.Mmusculus.UCSC.mm10);
+library(JASPAR2016)
+data("homer_pwms")
+data("mouse_pwms_v1") # mouse collection
+data("encode_pwms")
+
+
+setwd("/data/Kmita_Lab_data/scATAC_reanalysis_2020")
+
+
+
+#. Barcode selection
+#selecting the high-quality barcodes based on two major criteria: 
+#1) number of unique fragments; 2) fragments overlapping peak_ratio;
+snap.files = c( "possorted_bamko.snap", "possorted_bamwt.snap")
+sample.names = c("KO", "WT")
+barcode.files = c("singlecellKO.csv","singlecellWT.csv")
+x.sp.ls = lapply(seq(snap.files), function(i){
+  createSnap(file=snap.files[i],
+             sample=sample.names[i]);})
+
+barcode.ls = lapply(seq(snap.files), function(i){
+  barcodes = read.csv(barcode.files[i], head=TRUE)
+  barcodes = barcodes[2:nrow(barcodes),];   #remove NO BAROCDE line
+  barcodes$logUMI = log10(barcodes$passed_filters + 1);
+  barcodes$peak_ratio = (barcodes$peak_region_fragments+1) / (barcodes$passed_filters + 1);
+  barcodes})
+
+plots = lapply(seq(snap.files), function(i){
+  p1 = ggplot(barcode.ls[[i]],aes(x=logUMI, y=peak_ratio)) + 
+    geom_point(size=0.7, col="gray35") +
+    theme_classic() +
+    ggtitle(sample.names[[i]]) +
+    ylim(0, 1) + xlim(0, 6) + 
+    labs(x = "log10(UMI)", y="peak ratio")
+  p1})
+plots
+
+### for both datasets, we identify usable barcodes using [3.5-5] for log10(UMI) and [0.4-0.8] for promoter ratio as cutoff.
+cutoff.logUMI.low = c(3.5, 3.5);
+cutoff.logUMI.high = c(5, 5);
+cutoff.FRIP.low = c(0.25, 0.25);
+cutoff.FRIP.high = c(0.8, 0.8);
+barcode.ls = lapply(seq(snap.files), function(i){
+  barcodes = barcode.ls[[i]];
+  idx = which(barcodes$logUMI >= cutoff.logUMI.low[i] & 
+                barcodes$logUMI <= cutoff.logUMI.high[i] & 
+                barcodes$peak_ratio >= cutoff.FRIP.low[i] &
+                barcodes$peak_ratio <= cutoff.FRIP.high[i]);
+  barcodes[idx,]});
+
+x.sp.ls = lapply(seq(snap.files), function(i){
+  barcodes = barcode.ls[[i]];
+  x.sp = x.sp.ls[[i]];
+  barcode.shared = intersect(x.sp@barcode, barcodes$barcode);
+  x.sp = x.sp[match(barcode.shared, x.sp@barcode),];
+  barcodes = barcodes[match(barcode.shared, barcodes$barcode),];
+  x.sp@metaData = barcodes;
+  x.sp})
+rm(cutoff.logUMI.low,cutoff.logUMI.high,cutoff.
+  FRIP.low,cutoff.FRIP.high,snap.files,
+  sample.names,barcode.files)
+# combine two snap object
+x.sp = Reduce(snapRbind, x.sp.ls);
+x.sp@metaData["sample"] = x.sp@sample;
+x.sp
+
+
+# Add cell-by-bin matrix
+#Next, we add the cell-by-bin matrix of 5kb resolution to the snap object. This function will automatically read the cell-by-bin matrix 
+#from two snap files and add it to bmat attribute of snap object.
+#use snaptools to add the binmatrix )
+$snaptools snap-add-bmat  \
+--snap-file=demo.snap  \
+--bin-size-list 5000 10000  \
+--verbose=True
+
+# go back to R
+x.sp = addBmatToSnap(x.sp, bin.size=5000);
+x.sp
+
+
+# Matrix binarization
+# convert the cell-by-bin count matrix to a binary matrix. Some items in the count matrix have abnormally high coverage perhaps due to the alignment errors. 
+# Therefore, makeBinary removes the top 0.1% items in the count matrix and then converts the remaining non-zero values to 1.
+x.sp = makeBinary(x.sp, mat="bmat");
+x.sp
+
+
+#Bin filtering
+#filter out any bins overlapping with the ENCODE blacklist to prevent from potential artifacts.
+black_list = read.table("mm10.blacklist.bed.gz")
+black_list.gr = GRanges(black_list[,1], IRanges(black_list[,2], black_list[,3]))
+idy = queryHits(findOverlaps(x.sp@feature, black_list.gr))
+if(length(idy) > 0){x.sp = x.sp[,-idy, mat="bmat"]}
+x.sp
+
+# we remove unwanted chromosomes.
+chr.exclude = seqlevels(x.sp@feature)[grep("random|chrM", seqlevels(x.sp@feature))];
+idy = grep(paste(chr.exclude, collapse="|"), x.sp@feature);
+if(length(idy) > 0){ x.sp = x.sp[,-idy, mat="bmat"]}
+x.sp
+
+#Third, the coverage of bins roughly obeys a log normal distribution. We remove the top 5% bins that overlap with 
+#invariant features such as the house keeping gene promoters.
+bin.cov = log10(Matrix::colSums(x.sp@bmat)+1);
+hist(bin.cov[bin.cov > 0], 
+     xlab="log10(bin cov)", 
+     main="log10(Bin Cov)", 
+     col="lightblue", 
+     xlim=c(0, 5))
+bin.cutoff = quantile(bin.cov[bin.cov > 0], 0.95);
+idy = which(bin.cov <= bin.cutoff & bin.cov > 0);
+x.sp = x.sp[, idy, mat="bmat"];
+x.sp
+
+# remove any cells of bin coverage less than 1,000. The rational behind this is that some cells may have high number of 
+# unique fragments but end up with low bin coverage. This step is optional but highly recommanded.
+idx = which(Matrix::rowSums(x.sp@bmat) > 1000);
+x.sp = x.sp[idx,];
+x.sp
+
+# Dimensionality reduction 
+x.sp = runDiffusionMaps(obj= x.sp,input.mat="bmat", 
+                                 num.eigs=50)
+#Determine significant components for downstream analysis.  
+#pairwise plot and select the number of eigen vectors that the scatter plot starts looking like a blob
+plotDimReductPW(obj=x.sp, 
+                eigs.dims=1:50,
+                point.size=0.3,
+                point.color="gray35",
+                point.shape=19,
+                point.alpha=0.6,
+                down.sample=5000,
+                pdf.file.name=NULL, 
+                pdf.height=7, 
+                pdf.width=7)
+#screeplot helps determine the number of components to keep
+x=as.vector(c(1:50))
+y=x.sp@smat@sdev
+plot(x,y,pch=16,main="Screeplot",xlab="Principal Components", ylab="Standard deviation")
+axis(side=2, tck=-0.01,at=c(0,.02,.05,.10,0.15))
+abline(v = 10.5, col="red", lwd=1, lty=2)
+
+
+#Graph-based clustering
+#using the selected significant components, construct a K Nearest Neighbor (KNN) Graph. 
+#Each cell is a node and the k-nearest neighbors of each cell are identified according to the Euclidian distance 
+#and edges are drawn between neighbors in the graph 
+x.sp = runKNN(obj=x.sp,   eigs.dims=c(1:26),  k=15)
+# clustering using Leiden algorith install through pip with the following command
+$ pip install leidenalg
+
+x.sp=runCluster(obj=x.sp,
+                tmp.folder=tempdir(),
+                louvain.lib="leiden",
+                resolution=0.4)
+
+x.sp = runViz(obj=x.sp, 
+              tmp.folder=tempdir(),
+              dims=2,
+              eigs.dims=c(1:26), 
+              method="umap",
+              seed.use=10)
+
+# to define a color panel use the following command 
+colPanel = c("#4473c4","#ed7c31","#bfbfbf","#c7e5ff","#00b0f0","#ffbf00",
+"#ffdcc9","#70ad47","#f73b31","#6f30a0","#104000","#ff03ea", "#b3649f")​ 
+# costumize using you favorite colors but don't forget to update the plotViz function with your new color panel
+
+plotViz(obj= x.sp, method="umap", 
+        main="both",point.color=x.sp@cluster, 
+        point.size=0.3,point.shape=19, 
+        text.add=FALSE,text.size=1,text.halo.width=0,
+        text.color="black", 
+        legend.add=TRUE)
+# get number of cells per cluster 
+table(x.sp@cluster[x.sp@sample=="KO"])
+table(x.sp@cluster[x.sp@sample=="WT"])
+
+
+################ cluster plotting for KO
+plotViz(obj= x.sp[x.sp@sample=="KO"], method="umap", 
+        main="KO",point.color=x.sp@cluster[x.sp@sample=="KO"], 
+        point.size=0.3,point.shape=19, 
+        text.add=FALSE,text.size=1,
+        text.color="black", text.halo.width=0, down.sample = 3000,
+        legend.add=TRUE)
+
+################ cluster plotting for WT
+plotViz(obj= x.sp[x.sp@sample=="WT"], method="umap", 
+        main="WT",point.color=x.sp@cluster[x.sp@sample=="WT"], 
+        point.size=0.3,point.shape=19, 
+        text.add=FALSE,text.size=1,
+        text.color="black",text.halo.width=0,down.sample = 3000,
+        legend.add=TRUE)
+#################   UMI's per cell (looking for biases inherent to number of reads per cell)
+plotFeatureSingle(obj=x.sp,feature.value=x.sp@metaData[,"logUMI"],
+                  method="umap", main="read depth",
+                  point.size=0.2,point.shape=19, 
+                  down.sample=10000,quantiles=c(0.01, 0.99))
+plotFeatureSingle(obj=x.spKO,feature.value=x.spKO@metaData[,"logUMI"],
+                  method="umap", main="read depth",
+                  point.size=0.2,point.shape=19, 
+                  down.sample=10000,quantiles=c(0.01, 0.99))
+plotFeatureSingle(obj=x.spWT,feature.value=x.spWT@metaData[,"logUMI"],
+                  method="umap", main="read depth",
+                  point.size=0.2,point.shape=19, 
+                  down.sample=10000,quantiles=c(0.01, 0.99))
+
+#update path to your snapfile. the Snapatac object has path in it that is to be updated if you moved your snapfiles)
+x=x.sp@file
+x=str_replace_all(x,"/home/yasser/Downloads/possorted_bamko.snap","/data/Kmita_Lab_data/scATAC_analysis_2020/snaps_with_bins_only/possorted_bamko.snap")
+x=str_replace_all(x,"/home/yasser/Downloads/possorted_bamwt.snap","/data/Kmita_Lab_data/scATAC_analysis_2020/snaps_with_bins_only/possorted_bamwt.snap")
+x.sp@file=x
+rm(x)
+
+############## Peak calling for KO
+# --SPMR = Build Bedgraph file
+# --ext 73 = fragment size (because scATAC deliver fragment of size 73)
+# -B store Pileup file
+# -bw 250 = The bandwidth which is used to scan the genome ONLY for model building. Can be set to the expected sonication fragment size.
+# -mfild 10 30 = model parameters.
+
+x,spsafe=x.sp
+x.sp=x.sp[x.sp@sample=="KO"]
+clusters.sel = names(table(x.sp@cluster))[which(table(x.sp@cluster) > 0)];
+
+peaks.lsKO = mclapply(seq(clusters.sel), function(i){
+  print(clusters.sel[i]);
+  peaks = runMACS(obj=x.sp[which(x.sp@cluster==clusters.sel[i]),], 
+                  output.prefix=paste0("KO.", gsub(" ", "_", clusters.sel)[i]),
+                  path.to.snaptools="/home/yasser/miniconda2/envs/py3/bin/snaptools",
+                  path.to.macs="/home/yasser/miniconda2/envs/py2/bin/macs2",
+                  gsize="mm", # mm for mice data
+                  buffer.size=2000, 
+                  num.cores=1,
+                  macs.options="--nomodel --shift 37 --ext 73 --qval 1e-2 -B --SPMR --call-summits",
+                  keep.minimal = FALSE,
+                  tmp.folder=tempdir());
+  peaks}, mc.cores=1);
+peaks.namesKO = system("ls | grep narrowPeak", intern=TRUE);
+peak.gr.lsKO = lapply(peaks.namesKO, function(x){
+  peak.dfKO = read.table(x)
+  GRanges(peak.dfKO[,1], IRanges(peak.dfKO[,2], peak.dfKO[,3]))
+})
+peak.grKO = reduce(Reduce(c, peak.gr.lsKO));
+
+#####run macs2 wiht WT
+############## For WT then repeat the previous command 
+x.sp=x.spsafe
+x.sp=x.sp[x.sp@sample=="WT"]
+clusters.sel = names(table(x.sp@cluster))[which(table(x.sp@cluster) > 0)];
+peaks.lsWT = mclapply(seq(clusters.sel), function(i){
+  print(clusters.sel[i]);
+  peaks = runMACS(obj=x.sp[which(x.sp@cluster==clusters.sel[i]),], 
+                  output.prefix=paste0("WT.", gsub(" ", "_", clusters.sel)[i]),
+                  path.to.snaptools="/home/yasser/miniconda2/envs/Rstudio/bin/snaptools",
+                  path.to.macs="/home/yasser/miniconda2/envs/MACS2/bin/macs2",
+                  gsize="mm", # mm, hs, etc
+                  buffer.size=1000, 
+                  num.cores=1,
+                  macs.options="--nomodel --shift 37 --ext 73 --qval 1e-2 -B --SPMR --call-summits",
+                  keep.minimal = FALSE,
+                  tmp.folder=tempdir());
+  peaks}, mc.cores=1);
+x.sp=x.spsafe
+rm(x.spsafe)
+
+
+peaks.namesWT = system("ls | grep peakswt.narrowPeak", intern=TRUE);
+peak.gr.lsWT = lapply(peaks.namesWT, function(x){
+  peak.dfWT = read.table(x)
+  GRanges(peak.dfWT[,1], IRanges(peak.dfWT[,2], peak.dfWT[,3]))
+})
+peak.grWT = reduce(Reduce(c, peak.gr.lsWT));
+
+peaks.dfKO = as.data.frame(peak.grKO)[,1:3];
+write.table(peaks.dfKO,file = "peaks.combinedKO.bed",append=FALSE,
+            quote= FALSE,sep="\t", eol = "\n", na = "NA", dec = ".", 
+            row.names = FALSE, col.names = FALSE, qmethod = c("escape", "double"),
+            fileEncoding = "")
+
+
+peaks.dfWT = as.data.frame(peak.grWT)[,1:3];
+write.table(peaks.dfWT,file = "peaks.combinedWT.bed",append=FALSE,
+            quote= FALSE,sep="\t", eol = "\n", na = "NA", dec = ".", 
+            row.names = FALSE, col.names = FALSE, qmethod = c("escape", "double"),
+            fileEncoding = "")
+
+
+
+## add the two lists in one file (at the end of KO peak list copy/past all WTlist in a text editor). sort. and merge
+$ sort -k1,1 -k2,2n peaks.combined_added_KOWT > sortedaddedpeaks.combined.bed
+$ bedtools merge -i sortedaddedpeaks.combined.bed > merged_addedpeaks.combined.bed
+
+# add peak matrix to snapfile
+$ snaptools snap-add-pmat --snap-file possorted_bamwt.snap --peak-file merged_addedpeaks.combined.bed
+$ snaptools snap-add-pmat --snap-file possorted_bamko.snap --peak-file merged_addedpeaks.combined.bed
+# go back on R
+x.sp = addPmatToSnap(x.sp);
+x.sp = makeBinary(x.sp, mat="pmat");
+x.sp
+#### remove peaks aligning on scaffolds
+chr.exclude = seqlevels(x.sp@peak)[grep("random|chrM", seqlevels(x.sp@peak))];
+idy = grep(paste(chr.exclude, collapse="|"), x.sp@peak);
+if(length(idy) > 0){
+  x.sp = x.sp[,-idy, mat="pmat"]};
+#############################################################################
+## Motif discovery on every cluster based on first 2000 most relevant peaks 
+system("which findMotifsGenome.pl");
+x.sp=x.sp[x.sp@sample=="WT"]
+library(plyr)
+clusters.sel1=c(1:13)
+
+
+lapply(seq(clusters.sel1),  #### error at the end of Homers execution leading to failing of the loop
+       function(i){
+           idy=peaks.lsWT[[clusters.sel1[i]]]
+  idy=head(arrange(idy,desc(V5)), n = 2000)
+  idy=idy$V4
+  idy=match(as.character(idy),as.character(peaks.lsWT[[clusters.sel1[i]]][["V4"]]), nomatch=0)
+  idy=idy[idy>1]
+  print(clusters.sel1[i]);
+  })
+motifs = runHomer(  x.sp[,idy,"pmat"],  motif.length = 8, cache = 3000, num.cores=4,fdr.num = 20, mat = c("pmat", "bmat"),path.to.homer = "/home/yasser/miniconda2/envs/Rstudio/bin/findMotifsGenome.pl", 
+                    result.dir = paste0("/home/yasser/Downloads/WT._2k_peaks.",clusters.sel1[i]), genome = 'mm10', scan.size = 300,  optimize.count = 10, 
+                    background = 'automatic', local.background = FALSE, only.known = FALSE, only.denovo = FALSE, overwrite = TRUE, keep.minimal = FALSE);
+
+
+ 
+######## cluster specific motifs are recovered using peaks that are differentially accessible region specific to the cluster (using as a background all the other clusters)
+idy.ls = lapply(levels(x.sp@cluster), function(cluster_i){
+  x=c(1:13);
+  cluster_i=as.numeric(as.character(cluster_i));
+  cluster_i;
+  DARs = findDAR(
+    obj=x.sp,
+    input.mat="pmat",
+    cluster.pos=cluster_i,
+    cluster.neg=x[-cluster_i],
+    cluster.neg.method="knn",
+    bcv=0.1,
+    test.method="exactTest",
+    seed.use=10  )
+  DARs$FDR = p.adjust(DARs$PValue, method="BH");
+  idy = which(DARs$FDR < 5e-2 & DARs$logFC > 0);
+  if((x=length(idy)) < 2000L){
+    PValues = DARs$PValue;
+    PValues[DARs$logFC < 0] = 1;
+    idy = order(PValues, decreasing=FALSE)[1:2000];
+    rm(PValues)}  
+  idy})
+
+names(idy.ls) = levels(x.sp@cluster);
+par(mfrow = c(4, 4));
+covs = Matrix::rowSums(x.sp@pmat);
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i)
+  idy = idy.ls[[cluster_i]];
+  vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+  vals.zscore = (vals - mean(vals)) / sd(vals);
+  plot(DARs$logCPM, DARs$logFC, pch=19, cex=0.1, col="grey", ylab="logFC", xlab="logCPM", main="Selected DARs")
+  points(DARs$logCPM[idy], DARs$logFC[idy], pch=19, cex=0.5, col="red")
+  abline(h = 0, lwd=1, lty=2);
+  plotFeatureSingle(
+    obj=x.sp,
+    feature.value=vals.zscore,
+    method="umap", 
+    main= paste0("DARs specificity plot for cluster #",cluster_i,)
+    point.size=0.1, 
+    point.shape=19, 
+    down.sample=5000,
+    quantiles=c(0.01, 0.99));
+}
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i);
+  idy = idy.ls[[cluster_i]];
+  motifs = runHomer(  x.sp[,idy,"pmat"],  motif.length = 8, cache = 3000, num.cores=3,fdr.num = 20, mat = c("pmat", "bmat"),path.to.homer = "/home/yasser/miniconda2/envs/py2/bin/findMotifsGenome.pl", 
+                      result.dir =paste0("/home/yasser/Downloads/all_vs_",cluster_i), genome = 'mm10', scan.size = 300,  optimize.count = 3, background = 'automatic', local.background = FALSE, only.known = FALSE, only.denovo = FALSE, overwrite = TRUE, keep.minimal = FALSE);
+}
+
+
+
+#repeat same motif search for WT
+x.sp=x.sp[x.sp@sample=="WT"]
+idy.ls = lapply(levels(x.sp@cluster), function(cluster_i){
+  x=c(1:13);
+  cluster_i=as.numeric(as.character(cluster_i));
+  cluster_i;
+  DARs = findDAR(
+    obj=x.sp,
+    input.mat="pmat",
+    cluster.pos=cluster_i,
+    cluster.neg=x[-cluster_i],
+    cluster.neg.method="knn",
+    bcv=0.1,
+    test.method="exactTest",
+    seed.use=10  )
+  DARs$FDR = p.adjust(DARs$PValue, method="BH");
+  idy = which(DARs$FDR < 5e-2 & DARs$logFC > 0);
+  if((x=length(idy)) < 2000L){
+    PValues = DARs$PValue;
+    PValues[DARs$logFC < 0] = 1;
+    idy = order(PValues, decreasing=FALSE)[1:2000];
+    rm(PValues)}  
+  idy})
+
+names(idy.ls) = levels(x.sp@cluster);
+par(mfrow = c(4, 4));
+covs = Matrix::rowSums(x.sp@pmat);
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i)
+  idy = idy.ls[[cluster_i]];
+  vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+  vals.zscore = (vals - mean(vals)) / sd(vals);
+  plot(DARs$logCPM, DARs$logFC, pch=19, cex=0.1, col="grey", ylab="logFC", xlab="logCPM", main="Selected DARs")
+  points(DARs$logCPM[idy], DARs$logFC[idy], pch=19, cex=0.5, col="red")
+  abline(h = 0, lwd=1, lty=2);
+  plotFeatureSingle(
+    obj=x.sp,
+    feature.value=vals.zscore,
+    method="umap", 
+    main= paste0("DARs specificity plot for cluster #",cluster_i,)
+    point.size=0.1, 
+    point.shape=19, 
+    down.sample=5000,
+    quantiles=c(0.01, 0.99));
+}
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i);
+  idy = idy.ls[[cluster_i]];
+  motifs = runHomer(  x.sp[,idy,"pmat"],  motif.length = 8, cache = 3000, num.cores=3,fdr.num = 20, mat = c("pmat", "bmat"),path.to.homer = "/home/yasser/miniconda2/envs/py2/bin/findMotifsGenome.pl", 
+                      result.dir =paste0("/home/yasser/Downloads/WT_all_vs_",cluster_i), genome = 'mm10', scan.size = 300,  optimize.count = 3, background = 'automatic', local.background = FALSE, only.known = FALSE, only.denovo = FALSE, overwrite = TRUE, keep.minimal = FALSE);
+}
+#repeat same motif search for KO
+x.sp=x.spsafe
+x.sp=x.sp[x.sp@sample=="KO"]
+idy.ls = lapply(levels(x.sp@cluster), function(cluster_i){
+  x=c(1:13);
+  cluster_i=as.numeric(as.character(cluster_i));
+  cluster_i;
+  DARs = findDAR(
+    obj=x.sp,
+    input.mat="pmat",
+    cluster.pos=cluster_i,
+    cluster.neg=x[-cluster_i],
+    cluster.neg.method="knn",
+    bcv=0.1,
+    test.method="exactTest",
+    seed.use=10  )
+  DARs$FDR = p.adjust(DARs$PValue, method="BH");
+  idy = which(DARs$FDR < 5e-2 & DARs$logFC > 0);
+  if((x=length(idy)) < 2000L){
+    PValues = DARs$PValue;
+    PValues[DARs$logFC < 0] = 1;
+    idy = order(PValues, decreasing=FALSE)[1:2000];
+    rm(PValues)}  
+  idy})
+
+names(idy.ls) = levels(x.sp@cluster);
+par(mfrow = c(4, 4));
+covs = Matrix::rowSums(x.sp@pmat);
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i)
+  idy = idy.ls[[cluster_i]];
+  vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+  vals.zscore = (vals - mean(vals)) / sd(vals);
+  plot(DARs$logCPM, DARs$logFC, pch=19, cex=0.1, col="grey", ylab="logFC", xlab="logCPM", main="Selected DARs")
+  points(DARs$logCPM[idy], DARs$logFC[idy], pch=19, cex=0.5, col="red")
+  abline(h = 0, lwd=1, lty=2);
+  plotFeatureSingle(
+    obj=x.sp,
+    feature.value=vals.zscore,
+    method="umap", 
+    main= paste0("DARs specificity plot for cluster #",cluster_i,)
+    point.size=0.1, 
+    point.shape=19, 
+    down.sample=5000,
+    quantiles=c(0.01, 0.99));
+}
+for(cluster_i in levels(x.sp@cluster)){
+  print(cluster_i);
+  idy = idy.ls[[cluster_i]];
+  motifs = runHomer(  x.sp[,idy,"pmat"],  motif.length = 8, cache = 3000, num.cores=3,fdr.num = 20, mat = c("pmat", "bmat"),path.to.homer = "/home/yasser/miniconda2/envs/py2/bin/findMotifsGenome.pl", 
+                      result.dir =paste0("/home/yasser/Downloads/KO_all_vs_",cluster_i), genome = 'mm10', scan.size = 300,  optimize.count = 3, background = 'automatic', local.background = FALSE, only.known = FALSE, only.denovo = FALSE, overwrite = TRUE, keep.minimal = FALSE);
+}
+
+############# accessibility at Hoxa11 and Hox13 specific Binding sites.
+#using ChIPseq peak.bed files. we integrate the list of peaks from the ChIP experiments to assess accessibility at specific binding sites.
+setwd("/data/Kmita_Lab_data/scATAC_reanalysis_2020/Chip_peaks_on_snapfiles")
+common=read.table("common.Hoxa11.Hox13.csv",sep="\t",header=TRUE)
+a13=read.table("Hox13.specific.csv",sep="\t",header=TRUE)
+a11=read.table("Hoxa11.specific.csv",sep="\t",header=TRUE)
+x=rbind(common,a13,a11)
+x=x[,1:5]
+write.table(x,"chippeaks_with_all_column.bed",sep="\t",row.names = FALSE,quote = FALSE)
+
+#add chip peaks to snapfile containing only bins using snaptools
+$ snaptools snap-add-pmat --snap-file possorted_bamwt.snap --peak-file sorted_chippeaks.bed
+$ snaptools snap-add-pmat --snap-file possorted_bamko.snap --peak-file sorted_chippeaks.bed
+
+#### asses accessibility at specific binding sites.
+x=x.sp@file
+x=str_replace_all(x,"/home/yasser/Downloads/possorted_bamko.snap","/data/Kmita_Lab_data/scATAC_reanalysis_2020/Chip_peaks_on_snapfiles/possorted_bamko.snap")
+x=str_replace_all(x,"/home/yasser/Downloads/possorted_bamwt.snap","/data/Kmita_Lab_data/scATAC_reanalysis_2020/Chip_peaks_on_snapfiles/possorted_bamwt.snap")
+x.sp@file=x
+rm(x)
+x.sp = addPmatToSnap(x.sp);
+x.sp = makeBinary(x.sp, mat="pmat");
+x.sp
+#### add metadata to identify peaks of each ChIPseq experiment
+setwd("/data/Kmita_Lab_data/scATAC_reanalysis_2020/Chip_peaks_on_snapfiles")
+x=read.table("sortedchippeaks_with_all_column.bed")
+x.sp@peak$metadata=x$V5
+###### exclude peaks aligning on scaffolds
+chr.exclude = seqlevels(x.sp@peak)[grep("random|chrM", seqlevels(x.sp@peak))];
+idy = grep(paste(chr.exclude, collapse="|"), x.sp@peak);
+if(length(idy) > 0){
+x.sp = x.sp[,-idy, mat="pmat"]};
+x.sp
+###################
+#### exclude non-mesenchymal clusters
+
+
+idy = grep(paste("A11_only"), x.sp@peak$metadata);
+covs = Matrix::rowSums(x.sp@pmat);
+vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_Hoxa11_peak_enrich")
+
+idy = grep(paste("common"), x.sp@peak$metadata);
+covs = Matrix::rowSums(x.sp@pmat);
+vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_common_peak_enrich")
+
+idy = grep(paste("Hox13_only"), x.sp@peak$metadata);
+covs = Matrix::rowSums(x.sp@pmat);
+vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_Hox13_peak_enrich")
+
+x.sp=x.sp[x.sp@sample=="KO"]
+idy = grep(paste("Hox13_only"), x.sp@peak$metadata);
+covs = Matrix::rowSums(x.sp@pmat);
+vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_Hox13_peak_enrich")
+idy = grep(paste("A11_only"), x.sp@peak$metadata);
+covs = Matrix::rowSums(x.sp@pmat);
+vals = Matrix::rowSums(x.sp@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_Hoxa11_peak_enrich")
+
+
+
+
+#### due to high level of chromatin accessibility in cluster overshadowing the mesenchymal part, we remove cluster 9 and rerun
+
+cluster_exlude_9=c("1","2","3","4","5","6","7","8","10","11","12","13")
+x.sp_exclud9=x.sp[x.sp@cluster %in% cluster_exlude_9]
+idy = grep(paste("Hox13_only"), x.sp_exclud9@peak$metadata);
+covs = Matrix::rowSums(x.sp_exclud9@pmat);
+vals = Matrix::rowSums(x.sp_exclud9@pmat[,idy]) / covs;
+vals.zscore = (vals - mean(vals)) / sd(vals);
+plotFeatureSingle(  obj=x.sp_exclud9,  feature.value=vals.zscore,  method="umap",  point.size=0.1,   point.shape=19,   down.sample=5000,  quantiles=c(0.01, 0.99),  
+                    main="Chip_Hox13_excluding_cluster_9_peak_enrich")
+
+
+plotFeatureSingle(obj=x.sp,feature.value=x.sp@metaData[,"logUMI"],
+                  method="umap", main="read depth",
+                  point.size=0.2,point.shape=19, 
+                  down.sample=10000,quantiles=c(0.01, 0.99))
+############# Great Analysis , also, can be done directly by using the stanford.edu website (see the link below in the command)
+library(rGREAT);
+job = submitGreatJob(
+    gr                    = x.sp@peak[idy],
+    bg                    = NULL,
+    species               = "mm10",
+    includeCuratedRegDoms = TRUE,
+    rule                  = "basalPlusExt",
+    adv_upstream          = 5.0,
+    adv_downstream        = 1.0,
+    adv_span              = 1000.0,
+    adv_twoDistance       = 1000.0,
+    adv_oneDistance       = 1000.0,
+    request_interval = 300,
+    max_tries = 10,
+    version = "default",
+    base_url = "http://great.stanford.edu/public/cgi-bin"
+  );
+job
+tb = getEnrichmentTables(job);
+names(tb);
+head(tb[[1]])
+res = plotRegionGeneAssociationGraphs(job)
+res = plotRegionGeneAssociationGraphs(job, ontology = "GO_Molecular_Function", termID=######)
